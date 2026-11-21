@@ -100,6 +100,17 @@ type Options struct {
 	// used.
 	CheckQuery func(Query) (Query, error) `json:"-"`
 
+	// If non-nil, ReviewQuery is called with the caller's identity and each
+	// user-supplied query immediately before it is sent to the database.  If it
+	// reports an error, the query is rejected and not executed.
+	//
+	// Unlike CheckQuery, ReviewQuery receives the request context and runs after
+	// authorization and syntax checks, so it is suitable for slow or remote
+	// checks, such as asking an LLM whether the query is safe to run (see the
+	// llmreview package).  Named queries ("named:...") and meta-queries are
+	// defined by the operator and are not passed to ReviewQuery.
+	ReviewQuery func(ctx context.Context, caller string, q Query) error `json:"-"`
+
 	// If non-nil, send logs to this logger. If nil, use log.Printf.
 	Logf logger.Logf `json:"-"`
 }

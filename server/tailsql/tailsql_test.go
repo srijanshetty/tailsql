@@ -618,3 +618,48 @@ func (f *fakeDriver) Open(url string) (driver.Conn, error) {
 type fakeConn struct{ driver.Conn }
 
 func (fakeConn) Close() error { return nil }
+
+func TestReviewQuery(t *testing.T) {
+	_, db := mustInitSQLite(t)
+
+	var reviewed []string
+	s, err := tailsql.NewServer(tailsql.Options{
+		ReviewQuery: func(_ context.Context, caller string, q tailsql.Query) error {
+			reviewed = append(reviewed, q.Query)
+			if strings.Contains(q.Query, "forbidden") {
+				return errors.New("not allowed")
+			}
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewServer: unexpected error: %v", err)
+	}
+	s.SetDB("main", db, &tailsql.DBOptions{
+		NamedQueries: map[string]string{"one": "select 1 as forbidden"},
+	})
+	defer s.Close()
+
+	htest := httptest.NewServer(s.NewMux())
+	defer htest.Close()
+	cli := htest.Client()
+
+	get := func(q string) string {
+		return htest.URL + "/json?" + url.Values{"src": {"main"}, "q": {q}}.Encode()
+	}
+
+	t.Run("Approved", func(t *testing.T) {
+		mustGetFail(t, cli, get("select 'ok'"), http.StatusOK, "sec-tailsql", "1")
+	})
+	t.Run("Rejected", func(t *testing.T) {
+		mustGetFail(t, cli, get("select 'forbidden'"), http.StatusForbidden, "sec-tailsql", "1")
+	})
+	t.Run("NamedSkipsReview", func(t *testing.T) {
+		mustGetFail(t, cli, get("named:one"), http.StatusOK, "sec-tailsql", "1")
+	})
+
+	want := []string{"select 'ok'", "select 'forbidden'"}
+	if fmt.Sprint(reviewed) != fmt.Sprint(want) {
+		t.Errorf("Reviewed queries: got %q, want %q", reviewed, want)
+	}
+}

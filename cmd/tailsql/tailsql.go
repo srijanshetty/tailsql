@@ -19,6 +19,7 @@ import (
 
 	"github.com/creachadair/command"
 	"github.com/creachadair/flax"
+	"github.com/tailscale/tailsql/llmreview"
 	"github.com/tailscale/tailsql/server/tailsql"
 	"github.com/tailscale/tailsql/uirules"
 	"tailscale.com/atomicfile"
@@ -36,10 +37,14 @@ import (
 )
 
 var flags struct {
-	LocalPort  int    `flag:"local,Local service port"`
-	ConfigPath string `flag:"config,Configuration file (HuJSON, required)"`
-	DebugLog   bool   `flag:"debug,Enable very verbose tsnet debug logging"`
-	InitConfig string `flag:"init-config,Generate a basic configuration file in the given path and exit"`
+	LocalPort   int    `flag:"local,Local service port"`
+	ConfigPath  string `flag:"config,Configuration file (HuJSON, required)"`
+	DebugLog    bool   `flag:"debug,Enable very verbose tsnet debug logging"`
+	InitConfig  string `flag:"init-config,Generate a basic configuration file in the given path and exit"`
+	LLMReview   bool   `flag:"llm-review,Ask an LLM to approve each query before it runs"`
+	LLMProvider string `flag:"llm-provider,default=anthropic,LLM provider for --llm-review (anthropic, openai, aperture)"`
+	LLMModel    string `flag:"llm-model,Model for --llm-review (default claude-opus-5-5 for anthropic; required otherwise)"`
+	LLMBaseURL  string `flag:"llm-base-url,Base URL for the LLM provider (required for aperture, e.g. http://ai)"`
 }
 
 func main() {
@@ -82,6 +87,14 @@ with defaults suitable for running a local service and then exits.`,
 				uirules.FormatJSONText,
 				uirules.LinkURLText,
 			}
+			if flags.LLMReview {
+				p, err := newLLMProvider()
+				if err != nil {
+					return env.Usagef("--llm-review: %v", err)
+				}
+				opts.ReviewQuery = llmreview.New(llmreview.Options{Provider: p}).Review
+				log.Printf("LLM query review enabled (provider %s)", flags.LLMProvider)
+			}
 
 			ctx, cancel := signal.NotifyContext(env.Context(), syscall.SIGINT, syscall.SIGTERM)
 			defer cancel()
@@ -99,6 +112,33 @@ with defaults suitable for running a local service and then exits.`,
 		},
 	}
 	command.RunOrFail(root.NewEnv(nil), os.Args[1:])
+}
+
+// newLLMProvider constructs the query review provider selected by flags.
+// API keys are read from the environment (ANTHROPIC_API_KEY, OPENAI_API_KEY).
+func newLLMProvider() (llmreview.Provider, error) {
+	switch flags.LLMProvider {
+	case "anthropic":
+		return llmreview.NewAnthropic(llmreview.AnthropicOptions{
+			Model:   flags.LLMModel,
+			BaseURL: flags.LLMBaseURL,
+		}), nil
+	case "openai":
+		if flags.LLMModel == "" {
+			return nil, errors.New("--llm-model is required for provider openai")
+		}
+		return llmreview.NewOpenAI(llmreview.OpenAIOptions{
+			Model:   flags.LLMModel,
+			BaseURL: flags.LLMBaseURL,
+		}), nil
+	case "aperture":
+		if flags.LLMBaseURL == "" || flags.LLMModel == "" {
+			return nil, errors.New("--llm-base-url and --llm-model are required for provider aperture")
+		}
+		return llmreview.NewAperture(flags.LLMBaseURL, flags.LLMModel), nil
+	default:
+		return nil, fmt.Errorf("unknown provider %q (want anthropic, openai, or aperture)", flags.LLMProvider)
+	}
 }
 
 func runLocalService(ctx context.Context, opts tailsql.Options, port int) error {

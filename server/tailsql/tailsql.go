@@ -116,6 +116,7 @@ type Server struct {
 	rules     []UIRewriteRule
 	authorize func(string, *apitype.WhoIsResponse) error
 	qcheck    func(Query) (Query, error)
+	qreview   func(context.Context, string, Query) error
 	qtimeout  time.Duration
 	logf      logger.Logf
 
@@ -166,6 +167,7 @@ func NewServer(opts Options) (*Server, error) {
 		rules:     opts.UIRewriteRules,
 		authorize: opts.authorize(),
 		qcheck:    opts.checkQuery(),
+		qreview:   opts.ReviewQuery,
 		qtimeout:  opts.QueryTimeout.Duration(),
 		logf:      opts.logf(),
 		dbs:       dbs,
@@ -431,6 +433,17 @@ func (s *Server) queryContext(ctx context.Context, caller string, q Query) (*dbR
 	// database to execute.
 	if err := checkQuerySyntax(q.Query); err != nil {
 		return nil, statusErrorf(http.StatusBadRequest, "invalid query: %w", err)
+	}
+
+	// If a review hook is configured, it must approve user-supplied queries
+	// before they are executed. Named queries are operator-defined and trusted.
+	if s.qreview != nil && !strings.HasPrefix(q.Query, "named:") {
+		if err := s.qreview(ctx, caller, q); err != nil {
+			reviewRejectCount.Add(1)
+			s.logf("[tailsql] query rejected by review who=%q src=%q query=%q err=%v",
+				caller, q.Source, q.Query, err)
+			return nil, statusErrorf(http.StatusForbidden, "query rejected by review: %w", err)
+		}
 	}
 
 	const maxRowsPerQuery = 10000

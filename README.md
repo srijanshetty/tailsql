@@ -178,6 +178,50 @@ By default, the server does not do any authorization. The `LocalClient` option a
 
 To further customize authorization, you can provide a callback via the `Authorize` option. The [authorizer][authz] package provides some pre-defined implementations, or you can roll your own. This is useful if you want to expose multiple data sources, some of which have more restrictive access policies.
 
+### Query Review
+
+The `ReviewQuery` option is a hook that is called with the caller and each user-supplied query just before it is executed. If the hook reports an error, the query is rejected with HTTP 403 and never reaches the database. Named queries and meta-queries are defined by the operator and are not reviewed.
+
+The `llmreview` package provides an implementation that asks an LLM whether a query is safe to run under a configurable policy. By default it allows only read-only queries with no side effects. It fails closed: if the model can't be reached or gives no clear answer, the query is rejected.
+
+The model is reached through a `Provider`. Three are included:
+
+- `NewAnthropic`: the Anthropic Messages API (Claude). Set `BaseURL` to go through a gateway that serves that API.
+- `NewOpenAI`: any OpenAI-compatible Chat Completions API, such as OpenAI (ChatGPT models), Ollama, vLLM, or LiteLLM.
+- `NewAperture`: [Tailscale Aperture](https://tailscale.com/docs/aperture/what-is-aperture), through its OpenAI-compatible endpoint. Aperture identifies callers by their Tailscale identity, so no API key is needed.
+
+You can implement `Provider` yourself for anything else.
+
+```go
+// Claude, using ANTHROPIC_API_KEY.
+opts.ReviewQuery = llmreview.New(llmreview.Options{}).Review
+
+// Any model your Aperture admin has configured.
+opts.ReviewQuery = llmreview.New(llmreview.Options{
+   Provider: llmreview.NewAperture("http://ai", "claude-sonnet-5-5"),
+}).Review
+```
+
+The standalone `tailsql` command enables this with `--llm-review`:
+
+```shell
+# Claude (default provider; reads ANTHROPIC_API_KEY)
+./tailsql --config demo.conf --local 8080 --llm-review
+
+# OpenAI (reads OPENAI_API_KEY)
+./tailsql --config demo.conf --local 8080 --llm-review --llm-provider openai --llm-model gpt-5.5
+
+# Tailscale Aperture
+./tailsql --config demo.conf --local 8080 --llm-review --llm-provider aperture \
+    --llm-base-url http://ai --llm-model claude-sonnet-5-5
+
+# A local OpenAI-compatible server, such as Ollama
+./tailsql --config demo.conf --local 8080 --llm-review --llm-provider openai \
+    --llm-base-url http://localhost:11434/v1 --llm-model llama3.3
+```
+
+An LLM review adds a layer of protection but isn't a security boundary: the query text is user-controlled and could try to manipulate the reviewer. Keep connecting sources with read-only credentials.
+
 ### UI Rewrite Rules
 
 The server renders column values for the UI as plain strings, using some simple built-in rules for common data types. The `UIRewriteRules` option allows you to extend these rules with custom behaviour. The [uirules][uirules] package provides some pre-defined implementations, or you can roll your own.
