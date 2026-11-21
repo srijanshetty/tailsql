@@ -34,6 +34,9 @@ import (
 
 	// SQLite driver for database/sql.
 	_ "modernc.org/sqlite"
+
+	// PostgreSQL driver for database/sql (driver name "postgres").
+	_ "github.com/lib/pq"
 )
 
 var flags struct {

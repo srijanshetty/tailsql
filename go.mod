@@ -8,6 +8,7 @@ require (
 	github.com/creachadair/flax v0.0.5
 	github.com/google/go-cmp v0.7.0
 	github.com/klauspost/compress v1.20.0
+	github.com/lib/pq v1.12.3
 	github.com/tailscale/hujson v0.0.0-20260727124030-b80ff77dac4f
 	github.com/tailscale/setec v0.0.0-20260824224040-f8d7a936837c
 	github.com/tailscale/squibble v0.0.0-20260411062017-141f5d618bc4

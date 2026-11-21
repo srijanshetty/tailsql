@@ -165,9 +165,11 @@ func (r *Reviewer) Review(ctx context.Context, caller string, q tailsql.Query) e
 		var err error
 		v, err = r.ask(ctx, q)
 		if err != nil {
-			// Fail closed, and do not cache transient failures.
+			// Fail closed, and do not cache transient failures. Log the details,
+			// but do not return them to the caller: provider errors can reveal
+			// configuration such as credential sources or gateway addresses.
 			r.logf("[llmreview] review failed src=%q who=%q err=%v", q.Source, caller, err)
-			return fmt.Errorf("unable to review query: %w", err)
+			return errors.New("query review is unavailable; see server logs")
 		}
 		r.store(key, v)
 	}

@@ -42,10 +42,10 @@ func TestReviewer(t *testing.T) {
 		{"Safe", `{"safe": true, "reason": "read-only"}`, nil, ""},
 		{"Unsafe", `{"safe": false, "reason": "deletes rows"}`, nil, "deletes rows"},
 		{"Fenced", "```json\n{\"safe\": true, \"reason\": \"ok\"}\n```", nil, ""},
-		{"MissingSafe", `{"reason": "ok"}`, nil, "missing"},
-		{"Garbage", `sure, looks fine`, nil, "parse verdict"},
+		{"MissingSafe", `{"reason": "ok"}`, nil, "unavailable"},
+		{"Garbage", `sure, looks fine`, nil, "unavailable"},
 		{"Declined", "", llmreview.ErrDeclined, "declined"},
-		{"ProviderError", "", errors.New("connection refused"), "connection refused"},
+		{"ProviderError", "", errors.New("connection refused"), "unavailable"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -149,7 +149,7 @@ func TestOpenAI(t *testing.T) {
 	t.Run("HTTPError", func(t *testing.T) {
 		p := llmreview.NewOpenAI(llmreview.OpenAIOptions{Model: "m", BaseURL: srv.URL + "/wrong"})
 		err := llmreview.New(llmreview.Options{Provider: p, Logf: t.Logf}).Review(ctx, "user", q)
-		if err == nil || !strings.Contains(err.Error(), "unable to review") {
+		if err == nil || !strings.Contains(err.Error(), "unavailable") {
 			t.Errorf("Review: got %v, want review failure", err)
 		}
 	})
