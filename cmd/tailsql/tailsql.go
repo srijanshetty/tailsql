@@ -48,6 +48,7 @@ var flags struct {
 	LLMProvider string `flag:"llm-provider,default=anthropic,LLM provider for --llm-review (anthropic, openai, aperture)"`
 	LLMModel    string `flag:"llm-model,Model for --llm-review (default claude-opus-5-5 for anthropic; required otherwise)"`
 	LLMBaseURL  string `flag:"llm-base-url,Base URL for the LLM provider (required for aperture, e.g. http://ai)"`
+	LLMWrites   bool   `flag:"llm-allow-writes,Let targeted writes run and ask for confirmation on bulk writes (default: read-only)"`
 }
 
 func main() {
@@ -95,8 +96,15 @@ with defaults suitable for running a local service and then exits.`,
 				if err != nil {
 					return env.Usagef("--llm-review: %v", err)
 				}
-				opts.ReviewQuery = llmreview.New(llmreview.Options{Provider: p}).Review
-				log.Printf("LLM query review enabled (provider %s)", flags.LLMProvider)
+				opts.ReviewQuery = llmreview.New(llmreview.Options{
+					Provider:    p,
+					AllowWrites: flags.LLMWrites,
+				}).Review
+				mode := "read-only"
+				if flags.LLMWrites {
+					mode = "writes allowed, bulk writes need confirmation"
+				}
+				log.Printf("LLM query review enabled (provider %s, %s)", flags.LLMProvider, mode)
 			}
 
 			ctx, cancel := signal.NotifyContext(env.Context(), syscall.SIGINT, syscall.SIGTERM)

@@ -54,9 +54,11 @@ package tailsql
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"embed"
 	"encoding/csv"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -119,6 +121,7 @@ type Server struct {
 	qreview   func(context.Context, string, Query) error
 	qtimeout  time.Duration
 	logf      logger.Logf
+	audit     *auditLog // nil if no audit log is configured
 
 	mu  sync.Mutex
 	dbs []*setec.Updater[*dbHandle]
@@ -158,7 +161,15 @@ func NewServer(opts Options) (*Server, error) {
 	if opts.Metrics != nil {
 		addMetrics(opts.Metrics)
 	}
+	var audit *auditLog
+	if opts.AuditLog != "" {
+		audit, err = openAuditLog(opts.AuditLog)
+		if err != nil {
+			return nil, fmt.Errorf("opening audit log: %w", err)
+		}
+	}
 	return &Server{
+		audit:     audit,
 		lc:        opts.LocalClient,
 		state:     state,
 		self:      opts.LocalSource,
@@ -214,10 +225,11 @@ func (s *Server) SetSource(source string, db Queryable, opts *DBOptions) bool {
 // their errors.
 func (s *Server) Close() error {
 	dbs := s.getHandles()
-	errs := make([]error, len(dbs))
+	errs := make([]error, len(dbs), len(dbs)+1)
 	for i, db := range dbs {
 		errs[i] = db.close()
 	}
+	errs = append(errs, s.audit.close())
 	return errors.Join(errs...)
 }
 
@@ -252,10 +264,15 @@ func (s *Server) serveUI(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	caller, isAuthorized := s.checkAuth(w, r, q.Source, q.Query)
+	ident, isAuthorized := s.checkAuth(w, r, q.Source, q.Query)
 	if !isAuthorized {
 		authErrorCount.Add(1)
 		return
+	}
+	caller := ident.Who
+	r = r.WithContext(withIdentity(r.Context(), ident))
+	if tok := r.FormValue("confirm"); tok != "" {
+		r = r.WithContext(context.WithValue(r.Context(), confirmKey{}, tok))
 	}
 
 	switch r.URL.Path {
@@ -310,10 +327,16 @@ func (s *Server) serveUIInternal(w http.ResponseWriter, r *http.Request, caller 
 		Sources:     s.getHandles(),
 		Links:       s.links,
 		RoutePrefix: s.prefix,
+		Review:      s.qreview != nil,
 	}
 	out, err := s.queryContext(r.Context(), caller, q)
+	var warn ReviewWarning
 	if errors.Is(err, errTooManyRows) {
 		out.More = true
+	} else if errors.As(err, &warn) {
+		data.Warning = &warn.Reason
+		data.ConfirmToken = reviewConfirmToken(q)
+		return ui.Execute(w, data)
 	} else if err != nil {
 		queryErrorCount.Add(1)
 		msg := err.Error()
@@ -404,6 +427,24 @@ func (s *Server) serveMetaInternal(w http.ResponseWriter, r *http.Request) error
 	}{Meta: opts})
 }
 
+// confirmKey is the context key for a review confirmation token sent with a
+// request (the "confirm" parameter).
+type confirmKey struct{}
+
+// confirmToken returns the review confirmation token attached to ctx, or "".
+func confirmToken(ctx context.Context) string {
+	tok, _ := ctx.Value(confirmKey{}).(string)
+	return tok
+}
+
+// reviewConfirmToken returns the token a caller must send to confirm a review
+// warning for q. It is derived from the source and query text, so a
+// confirmation applies only to the exact query that was warned about.
+func reviewConfirmToken(q Query) string {
+	sum := sha256.Sum256([]byte(q.Source + "\x00" + q.Query))
+	return hex.EncodeToString(sum[:12])
+}
+
 // errTooManyRows is a sentinel error reported by queryContextAny when a
 // sensible bound on the size of the result set is exceeded.
 var errTooManyRows = errors.New("too many rows")
@@ -414,9 +455,26 @@ var errTooManyRows = errors.New("too many rows")
 // If the number of rows exceeds a sensible limit, it reports errTooManyRows.
 // In that case, the result set is still valid, and contains the results that
 // were read up to that point.
-func (s *Server) queryContext(ctx context.Context, caller string, q Query) (*dbResult, error) {
+func (s *Server) queryContext(ctx context.Context, caller string, q Query) (res *dbResult, err error) {
 	if q.Query == "" {
 		return nil, nil
+	}
+
+	// Record every query in the audit log, if there is one.
+	id := identityFrom(ctx)
+	audit := &auditEntry{
+		Time:          time.Now().UTC(),
+		Who:           caller,
+		Node:          id.Node,
+		Authenticated: id.Authenticated,
+		Source:        q.Source,
+		Query:         q.Query,
+		Review:        "off",
+	}
+	var blocked bool
+	defer func() { s.finishAudit(audit, res, err, blocked) }()
+	if s.qreview != nil {
+		audit.Review = "skipped" // updated below if the query is reviewed
 	}
 
 	// As a special case, treat a query prefixed with "meta:" as a meta-query to
@@ -438,11 +496,34 @@ func (s *Server) queryContext(ctx context.Context, caller string, q Query) (*dbR
 	// If a review hook is configured, it must approve user-supplied queries
 	// before they are executed. Named queries are operator-defined and trusted.
 	if s.qreview != nil && !strings.HasPrefix(q.Query, "named:") {
+		audit.Review = "allowed"
 		if err := s.qreview(ctx, caller, q); err != nil {
-			reviewRejectCount.Add(1)
-			s.logf("[tailsql] query rejected by review who=%q src=%q query=%q err=%v",
-				caller, q.Source, q.Query, err)
-			return nil, statusErrorf(http.StatusForbidden, "query rejected by review: %w", err)
+			var warn ReviewWarning
+			if !errors.As(err, &warn) {
+				blocked = true
+				audit.Review, audit.ReviewReason = "denied", err.Error()
+				reviewRejectCount.Add(1)
+				s.logf("[tailsql] query rejected by review who=%q src=%q query=%q err=%v",
+					caller, q.Source, q.Query, err)
+				return nil, statusErrorf(http.StatusForbidden, "query rejected by review: %w", err)
+			}
+
+			// A warning can be overridden, but only by a confirmation that names
+			// this exact query text. A confirmation never overrides a rejection.
+			audit.ReviewReason = warn.Reason
+			if confirmToken(ctx) != reviewConfirmToken(q) {
+				blocked = true
+				audit.Review = "needs_confirmation"
+				reviewWarnCount.Add(1)
+				s.logf("[tailsql] query needs confirmation who=%q src=%q query=%q reason=%q",
+					caller, q.Source, q.Query, warn.Reason)
+				return nil, statusErrorf(http.StatusConflict,
+					"query %w (to run it anyway, resend with confirm=%s)", warn, reviewConfirmToken(q))
+			}
+			audit.Review = "confirmed"
+			reviewConfirmCount.Add(1)
+			s.logf("[tailsql] query confirmed despite review warning who=%q src=%q query=%q reason=%q",
+				caller, q.Source, q.Query, warn.Reason)
 		}
 	}
 
@@ -589,36 +670,39 @@ func (s *Server) dbHandleForSource(src string) *dbHandle {
 // given source.  If the caller does not have access, checkAuth logs an error
 // to w and returns false.  The reported caller name will be "" if no caller
 // can be identified.
-func (s *Server) checkAuth(w http.ResponseWriter, r *http.Request, src, query string) (string, bool) {
+func (s *Server) checkAuth(w http.ResponseWriter, r *http.Request, src, query string) (callerIdentity, bool) {
 	// If there is no local client, allow everything.
 	if s.lc == nil {
-		return "", true
+		return callerIdentity{}, true
 	}
 	whois, err := s.lc.WhoIs(r.Context(), r.RemoteAddr)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return "", false
+		return callerIdentity{}, false
 	} else if whois == nil {
 		http.Error(w, "not logged in", http.StatusUnauthorized)
-		return "", false
+		return callerIdentity{}, false
 	}
-	var caller string
+	id := callerIdentity{Authenticated: true}
+	if whois.Node != nil {
+		id.Node = strings.TrimSuffix(whois.Node.Name, ".")
+	}
 	if whois.Node.IsTagged() {
-		caller = whois.Node.Name
+		id.Who = whois.Node.Name
 	} else {
-		caller = whois.UserProfile.LoginName
+		id.Who = whois.UserProfile.LoginName
 	}
 
 	// If the caller wants the UI or metadata, and didn't send a query, allow it.
 	// The source does not matter when there is no query.
 	if (r.URL.Path == "/" || r.URL.Path == "/meta") && query == "" {
-		return caller, true
+		return id, true
 	}
 	if err := s.authorize(src, whois); err != nil {
 		http.Error(w, err.Error(), http.StatusForbidden)
-		return caller, false
+		return id, false
 	}
-	return caller, true
+	return id, true
 }
 
 // getHandles returns the current slice of database handles.  THe caller must

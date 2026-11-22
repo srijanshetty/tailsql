@@ -17,7 +17,8 @@
   </div>{{end}}
   <form id="qform" method="GET">
     <textarea name="q" rows=10 cols=90 id="query">{{- .Query -}} </textarea><br />
-    <span class="uihint">Hint: Use shift-enter to submit your query</span>
+    <span class="uihint">Hint: Use shift-enter to submit your query</span>{{if .Review}}
+    <span class="uihint review-hint">Queries are checked by an LLM before they run.</span>{{end}}
     <div class="action">
       <span><button id="send-query" class="ctrl" title="query">Query</button></span>
       <span><button class="ctrl" id="dl-button" title="download">Download as CSV</button></span>
@@ -25,7 +26,11 @@
       <span><label>Source: <select id="sources" class="ctrl" name="src">{{range $s := .Sources}}
         <option class="ctrl" value="{{$s.Source}}"{{if eq $.Source .Source}} selected{{end}}>{{$s.Label}}</option>
       {{end}}</select></label></span>
-    </div>
+    </div>{{if .Review}}
+    <div id="review-status" class="review-status" role="status" aria-live="polite" hidden>
+      <span class="spinner" aria-hidden="true"></span>
+      <span>LLM is analyzing your query&hellip;</span>
+    </div>{{end}}
   </form>
 </div>
 {{with .Links}}<div class="meta">
@@ -44,6 +49,15 @@
   </details>
 </div>
 
+{{with .Warning}}
+<div id="warning" class="output"><div class="warning" role="alert">
+  <span>Warning:</span>
+  <span>{{.}}</span>
+  <span class="warning-action">
+    <button class="ctrl danger" type="submit" form="qform" name="confirm" value="{{$.ConfirmToken}}"
+      title="run this exact query despite the warning">Run anyway</button>
+  </span>
+</div></div>{{end -}}
 {{with .Error}}
 <div id="error" class="output"><div class="error">
   <span>Error:</span>

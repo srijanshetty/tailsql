@@ -7,6 +7,7 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"html"
@@ -16,6 +17,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -621,13 +623,18 @@ func (fakeConn) Close() error { return nil }
 
 func TestReviewQuery(t *testing.T) {
 	_, db := mustInitSQLite(t)
+	auditPath := filepath.Join(t.TempDir(), "audit.jsonl")
 
 	var reviewed []string
 	s, err := tailsql.NewServer(tailsql.Options{
+		AuditLog: auditPath,
 		ReviewQuery: func(_ context.Context, caller string, q tailsql.Query) error {
 			reviewed = append(reviewed, q.Query)
-			if strings.Contains(q.Query, "forbidden") {
+			switch {
+			case strings.Contains(q.Query, "forbidden"):
 				return errors.New("not allowed")
+			case strings.Contains(q.Query, "bulk"):
+				return tailsql.ReviewWarning{Reason: "changes many rows"}
 			}
 			return nil
 		},
@@ -644,8 +651,22 @@ func TestReviewQuery(t *testing.T) {
 	defer htest.Close()
 	cli := htest.Client()
 
-	get := func(q string) string {
-		return htest.URL + "/json?" + url.Values{"src": {"main"}, "q": {q}}.Encode()
+	get := func(q string, extra ...string) string {
+		v := url.Values{"src": {"main"}, "q": {q}}
+		for i := 0; i+1 < len(extra); i += 2 {
+			v.Set(extra[i], extra[i+1])
+		}
+		return htest.URL + "/json?" + v.Encode()
+	}
+	body := func(t *testing.T, u string) (int, string) {
+		t.Helper()
+		rsp, err := cli.Do(mustGetRequest(t, u, "sec-tailsql", "1"))
+		if err != nil {
+			t.Fatalf("Get %q: %v", u, err)
+		}
+		defer rsp.Body.Close()
+		b, _ := io.ReadAll(rsp.Body)
+		return rsp.StatusCode, string(b)
 	}
 
 	t.Run("Approved", func(t *testing.T) {
@@ -658,8 +679,148 @@ func TestReviewQuery(t *testing.T) {
 		mustGetFail(t, cli, get("named:one"), http.StatusOK, "sec-tailsql", "1")
 	})
 
-	want := []string{"select 'ok'", "select 'forbidden'"}
-	if fmt.Sprint(reviewed) != fmt.Sprint(want) {
-		t.Errorf("Reviewed queries: got %q, want %q", reviewed, want)
+	const bulk = "select 'bulk'"
+	var token string
+	t.Run("WarningNeedsConfirmation", func(t *testing.T) {
+		code, msg := body(t, get(bulk))
+		if code != http.StatusConflict {
+			t.Fatalf("Got status %d, want %d (%s)", code, http.StatusConflict, msg)
+		}
+		m := regexp.MustCompile(`confirm=([0-9a-f]+)`).FindStringSubmatch(msg)
+		if m == nil || !strings.Contains(msg, "changes many rows") {
+			t.Fatalf("Response %q lacks reason or confirmation token", msg)
+		}
+		token = m[1]
+	})
+	t.Run("WrongTokenRefused", func(t *testing.T) {
+		mustGetFail(t, cli, get(bulk, "confirm", "0123456789abcdef01234567"), http.StatusConflict, "sec-tailsql", "1")
+	})
+	t.Run("TokenIsPerQuery", func(t *testing.T) {
+		mustGetFail(t, cli, get("select 'bulk' as other", "confirm", token), http.StatusConflict, "sec-tailsql", "1")
+	})
+	t.Run("ConfirmedRuns", func(t *testing.T) {
+		mustGetFail(t, cli, get(bulk, "confirm", token), http.StatusOK, "sec-tailsql", "1")
+	})
+	t.Run("ConfirmCannotOverrideDeny", func(t *testing.T) {
+		code, _ := body(t, get("select 'forbidden'", "confirm", token))
+		if code != http.StatusForbidden {
+			t.Errorf("Got status %d, want %d", code, http.StatusForbidden)
+		}
+	})
+
+	t.Run("UI", func(t *testing.T) {
+		v := url.Values{"src": {"main"}, "q": {bulk}}
+		ui := string(mustGet(t, cli, htest.URL+"/?"+v.Encode(), "sec-tailsql", "1"))
+		for _, want := range []string{
+			`id="review-status"`,
+			"LLM is analyzing your query",
+			"Queries are checked by an LLM",
+			"changes many rows",
+			`name="confirm" value="` + token + `"`,
+			"Run anyway",
+		} {
+			if !strings.Contains(ui, want) {
+				t.Errorf("UI page is missing %q", want)
+			}
+		}
+	})
+
+	t.Run("AuditLog", func(t *testing.T) {
+		data, err := os.ReadFile(auditPath)
+		if err != nil {
+			t.Fatalf("Read audit log: %v", err)
+		}
+		type entry struct {
+			Who           string `json:"who"`
+			Authenticated bool   `json:"authenticated"`
+			Query         string `json:"query"`
+			Review        string `json:"review"`
+			ReviewReason  string `json:"review_reason"`
+			Outcome       string `json:"outcome"`
+			Rows          int    `json:"rows"`
+		}
+		var got []entry
+		for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+			var e entry
+			if err := json.Unmarshal([]byte(line), &e); err != nil {
+				t.Fatalf("Invalid audit line %q: %v", line, err)
+			}
+			got = append(got, e)
+		}
+		want := []struct{ query, review, outcome string }{
+			{"select 'ok'", "allowed", "ok"},
+			{"select 'forbidden'", "denied", "blocked"},
+			{"named:one", "skipped", "ok"},
+			{bulk, "needs_confirmation", "blocked"},
+			{bulk, "needs_confirmation", "blocked"},
+			{"select 'bulk' as other", "needs_confirmation", "blocked"},
+			{bulk, "confirmed", "ok"},
+			{"select 'forbidden'", "denied", "blocked"},
+			{bulk, "needs_confirmation", "blocked"},
+		}
+		if len(got) != len(want) {
+			t.Fatalf("Got %d audit entries, want %d:\n%s", len(got), len(want), data)
+		}
+		for i, w := range want {
+			g := got[i]
+			if g.Query != w.query || g.Review != w.review || g.Outcome != w.outcome {
+				t.Errorf("Entry %d: got (%q, %s, %s), want (%q, %s, %s)",
+					i, g.Query, g.Review, g.Outcome, w.query, w.review, w.outcome)
+			}
+			if g.Authenticated || g.Who != "" {
+				t.Errorf("Entry %d: got who=%q authenticated=%v, want unauthenticated", i, g.Who, g.Authenticated)
+			}
+		}
+		if got[0].Rows != 1 {
+			t.Errorf("Entry 0: got %d rows, want 1", got[0].Rows)
+		}
+		if got[3].ReviewReason != "changes many rows" {
+			t.Errorf("Entry 3: got reason %q", got[3].ReviewReason)
+		}
+	})
+}
+
+func TestAuditIdentity(t *testing.T) {
+	_, db := mustInitSQLite(t)
+	auditPath := filepath.Join(t.TempDir(), "audit.jsonl")
+
+	fc := &fakeClient{
+		isLogged: true,
+		result: &apitype.WhoIsResponse{
+			Node:        &tailcfg.Node{Name: "laptop.example.ts.net."},
+			UserProfile: &tailcfg.UserProfile{LoginName: "alice@example.com"},
+		},
+	}
+	s, err := tailsql.NewServer(tailsql.Options{LocalClient: fc, AuditLog: auditPath})
+	if err != nil {
+		t.Fatalf("NewServer: unexpected error: %v", err)
+	}
+	s.SetDB("main", db, nil)
+	defer s.Close()
+
+	htest := httptest.NewServer(s.NewMux())
+	defer htest.Close()
+	u := htest.URL + "/json?" + url.Values{"src": {"main"}, "q": {"select 1"}}.Encode()
+	mustGetFail(t, htest.Client(), u, http.StatusOK, "sec-tailsql", "1")
+
+	data, err := os.ReadFile(auditPath)
+	if err != nil {
+		t.Fatalf("Read audit log: %v", err)
+	}
+	var e struct {
+		Who           string `json:"who"`
+		Node          string `json:"node"`
+		Authenticated bool   `json:"authenticated"`
+		Review        string `json:"review"`
+		Outcome       string `json:"outcome"`
+	}
+	if err := json.Unmarshal(data, &e); err != nil {
+		t.Fatalf("Invalid audit entry %q: %v", data, err)
+	}
+	if e.Who != "alice@example.com" || e.Node != "laptop.example.ts.net" || !e.Authenticated {
+		t.Errorf("Got who=%q node=%q authenticated=%v, want alice@example.com on laptop", e.Who, e.Node, e.Authenticated)
+	}
+	if e.Review != "off" || e.Outcome != "ok" {
+		t.Errorf("Got review=%q outcome=%q, want off/ok", e.Review, e.Outcome)
 	}
 }

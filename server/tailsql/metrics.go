@@ -21,6 +21,8 @@ var (
 	internalErrorCount   = new(expvar.Int)
 	queryErrorCount      = new(expvar.Int)
 	reviewRejectCount    = new(expvar.Int)
+	reviewWarnCount      = new(expvar.Int)
+	reviewConfirmCount   = new(expvar.Int)
 )
 
 func init() {
@@ -34,6 +36,8 @@ func init() {
 	apiErrorCount.Set("internal", internalErrorCount)
 	apiErrorCount.Set("query", queryErrorCount)
 	apiErrorCount.Set("review_rejected", reviewRejectCount)
+	apiErrorCount.Set("review_needs_confirm", reviewWarnCount)
+	apiRequestCount.Set("review_confirmed", reviewConfirmCount)
 }
 
 func addMetrics(m *expvar.Map) {

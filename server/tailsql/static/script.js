@@ -13,6 +13,7 @@ import { Params, Area, Cycle, Loop } from './sprite.js';
     const historyList  = document.getElementById('history-list');
     const clearHistory = document.getElementById('clear-history');
     const savedList    = document.getElementById('saved-query-list');
+    const reviewStatus = document.getElementById('review-status'); // null if review is off
 
     const nuts = /a?corn|\bnut\b|seed|squirrel|suna|tailsql/i;
     const velo = 5, delay = 60, runChance = 0.04;
@@ -247,6 +248,18 @@ import { Params, Area, Cycle, Loop } from './sprite.js';
     window.addEventListener("load", (evt) => { query.focus(); });
     // Refresh when the input source changes.
     sources.addEventListener('change', (evt) => { qform.submit() });
+
+    // When queries are reviewed by an LLM, show that the review is under way,
+    // since it can take a few seconds before the results page loads.
+    if (reviewStatus) {
+        qform.addEventListener('submit', (evt) => {
+            if (hasQuery()) {
+                reviewStatus.hidden = false;
+            }
+        });
+        // Hide it again if the page is restored from the back/forward cache.
+        window.addEventListener('pageshow', () => { reviewStatus.hidden = true; });
+    }
 
     // Persist open/closed state of query panels across page reloads.
     document.querySelectorAll('#query-panels details').forEach((d) => {

@@ -34,18 +34,22 @@ func TestReviewer(t *testing.T) {
 	logf := t.Logf
 
 	tests := []struct {
-		name    string
-		reply   string
-		err     error
-		wantErr string // "" means approved
+		name     string
+		reply    string
+		err      error
+		wantErr  string // "" means approved
+		wantWarn bool   // expect a tailsql.ReviewWarning
 	}{
-		{"Safe", `{"safe": true, "reason": "read-only"}`, nil, ""},
-		{"Unsafe", `{"safe": false, "reason": "deletes rows"}`, nil, "deletes rows"},
-		{"Fenced", "```json\n{\"safe\": true, \"reason\": \"ok\"}\n```", nil, ""},
-		{"MissingSafe", `{"reason": "ok"}`, nil, "unavailable"},
-		{"Garbage", `sure, looks fine`, nil, "unavailable"},
-		{"Declined", "", llmreview.ErrDeclined, "declined"},
-		{"ProviderError", "", errors.New("connection refused"), "unavailable"},
+		{"Allow", `{"decision": "allow", "reason": "read-only"}`, nil, "", false},
+		{"Deny", `{"decision": "deny", "reason": "drops a table"}`, nil, "drops a table", false},
+		{"Warn", `{"decision": "warn", "reason": "UPDATE has no WHERE clause"}`, nil, "UPDATE has no WHERE clause", true},
+		{"CaseInsensitive", `{"decision": "ALLOW", "reason": "ok"}`, nil, "", false},
+		{"UnknownDecisionDenies", `{"decision": "maybe", "reason": "hmm"}`, nil, "hmm", false},
+		{"Fenced", "```json\n{\"decision\": \"allow\", \"reason\": \"ok\"}\n```", nil, "", false},
+		{"OldFormatFailsClosed", `{"safe": true, "reason": "ok"}`, nil, "unavailable", false},
+		{"Garbage", `sure, looks fine`, nil, "unavailable", false},
+		{"Declined", "", llmreview.ErrDeclined, "declined", false},
+		{"ProviderError", "", errors.New("connection refused"), "unavailable", false},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -58,14 +62,20 @@ func TestReviewer(t *testing.T) {
 				if err != nil {
 					t.Errorf("Review: got %v, want nil", err)
 				}
-			} else if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
 				t.Errorf("Review: got %v, want error containing %q", err, tc.wantErr)
+			}
+			var warn tailsql.ReviewWarning
+			if got := errors.As(err, &warn); got != tc.wantWarn {
+				t.Errorf("Review: got warning=%v, want %v (err=%v)", got, tc.wantWarn, err)
 			}
 		})
 	}
 
 	t.Run("Cache", func(t *testing.T) {
-		fp := &fakeProvider{reply: `{"safe": false, "reason": "no"}`}
+		fp := &fakeProvider{reply: `{"decision": "deny", "reason": "no"}`}
 		r := llmreview.New(llmreview.Options{Provider: fp, Logf: logf})
 		for range 3 {
 			r.Review(ctx, "user", q)
@@ -90,7 +100,7 @@ func TestReviewer(t *testing.T) {
 func TestOpenAI(t *testing.T) {
 	var gotAuth string
 	var gotReq map[string]any
-	reply := `{"choices":[{"message":{"content":"{\"safe\":false,\"reason\":\"drops a table\"}"},"finish_reason":"stop"}]}`
+	reply := `{"choices":[{"message":{"content":"{\"decision\":\"deny\",\"reason\":\"drops a table\"}"},"finish_reason":"stop"}]}`
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/chat/completions" {
@@ -153,4 +163,35 @@ func TestOpenAI(t *testing.T) {
 			t.Errorf("Review: got %v, want review failure", err)
 		}
 	})
+}
+
+// policyProvider records the system prompt it was given.
+type policyProvider struct{ system string }
+
+func (p *policyProvider) Complete(_ context.Context, system, _ string, _ map[string]any) (string, error) {
+	p.system = system
+	return `{"decision": "allow", "reason": "ok"}`, nil
+}
+
+func TestPolicySelection(t *testing.T) {
+	q := tailsql.Query{Source: "main", Query: "select 1"}
+	for _, tc := range []struct {
+		name string
+		opts llmreview.Options
+		want string
+	}{
+		{"Default", llmreview.Options{}, llmreview.DefaultPolicy},
+		{"AllowWrites", llmreview.Options{AllowWrites: true}, llmreview.WritePolicy},
+		{"Custom", llmreview.Options{AllowWrites: true, Policy: "custom policy"}, "custom policy"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := new(policyProvider)
+			tc.opts.Provider = p
+			tc.opts.Logf = t.Logf
+			llmreview.New(tc.opts).Review(context.Background(), "user", q)
+			if !strings.Contains(p.system, tc.want) {
+				t.Errorf("System prompt does not contain the expected policy %q", tc.name)
+			}
+		})
+	}
 }

@@ -37,6 +37,10 @@ type uiData struct {
 	Error       *string     // error results (may be nil)
 	Links       []UILink    // static UI links
 	RoutePrefix string      // for links to the API and static files
+
+	Review       bool    // whether queries are checked by a review hook
+	Warning      *string // review warning that needs confirmation (may be nil)
+	ConfirmToken string  // token to confirm the review warning
 }
 
 // Version reports the version string of the currently running binary.

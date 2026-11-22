@@ -220,7 +220,33 @@ The standalone `tailsql` command enables this with `--llm-review`:
     --llm-base-url http://localhost:11434/v1 --llm-model llama3.3
 ```
 
-An LLM review adds a layer of protection but isn't a security boundary: the query text is user-controlled and could try to manipulate the reviewer. Keep connecting sources with read-only credentials.
+A review hook can also return a `tailsql.ReviewWarning` instead of an error. Then the query isn't rejected outright: the UI shows the warning with a **Run anyway** button, and the API answers with HTTP 409 and a `confirm` token. Resending the same query with `confirm=<token>` runs it. The token is tied to the exact query text, and it can't override a rejection.
+
+By default the `llmreview` reviewer is read-only: it allows reads and denies all writes. With `Options.AllowWrites` (or `--llm-allow-writes` on the command line), it uses a write policy instead:
+
+| Query | Decision |
+|---|---|
+| Reads, and targeted writes (`UPDATE … WHERE id = 42`, inserts of literal rows) | runs |
+| Bulk writes (`UPDATE`/`DELETE` with no `WHERE`, or a broad one such as a status, date range, or `LIKE`) | warns, and runs only if confirmed |
+| Schema changes, `TRUNCATE`, permission changes, file/program access, multiple statements | denied |
+
+While a reviewed query is running, the UI shows that the LLM is analyzing it.
+
+An LLM review adds a layer of protection but isn't a security boundary: the query text is user-controlled and could try to manipulate the reviewer. Keep connecting sources with read-only credentials unless you mean to allow writes.
+
+### Audit Log
+
+Set `auditLog` in the configuration to a file path, and the server appends one JSON line for each query:
+
+```json
+{"time":"2026-11-22T09:12:03Z","who":"alice@example.com","node":"laptop.example.ts.net","authenticated":true,"source":"pg","query":"update orders set status = 'shipped'","review":"confirmed","review_reason":"UPDATE has no WHERE clause, so it changes every row in orders.","outcome":"ok","rows":0,"elapsed_ms":41}
+```
+
+- `who` and `node` are the caller's Tailscale identity. They are filled in only when the server checks identities, which means running on Tailscale rather than with `--local`. Otherwise `who` is empty and `authenticated` is false.
+- `review` is one of `off`, `skipped` (named and meta-queries), `allowed`, `needs_confirmation`, `confirmed`, or `denied`.
+- `outcome` is `ok`, `blocked` (stopped by review), or `error`.
+
+The file is created with mode 0600, since it contains query text.
 
 ### UI Rewrite Rules
 

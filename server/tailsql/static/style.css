@@ -7,6 +7,10 @@
   --cell-border: #444;
   --bg-colname: #eef;
   --btn-focus: #ddf;
+  --bg-warning: #fff3cd;
+  --bg-warning-label: #f0c36d;
+  --danger: #b42318;
+  --danger-text: #fff;
   --body-font: -apple-system, system-ui, Helvetica, Arial, sans-serif;
 }
 
@@ -271,4 +275,57 @@ div.action {
   width: 32px;
   background: url('nut.png') 0px 0px;
   visibility: hidden;
+}
+
+/* LLM query review */
+.review-hint {
+  display: block;
+}
+.review-status {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 0.75rem;
+  color: var(--text-light);
+}
+.review-status[hidden] {
+  display: none;
+}
+.spinner {
+  width: 1em;
+  height: 1em;
+  border: 2px solid var(--bg-colname);
+  border-top-color: var(--text-light);
+  border-radius: 50%;
+  animation: review-spin 0.8s linear infinite;
+}
+@keyframes review-spin {
+  to { transform: rotate(360deg); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .spinner { animation-duration: 2.4s; }
+}
+div.warning {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-start;
+}
+.warning span {
+  padding: 0.5rem;
+  flex: 1 1 min-content;
+  background: var(--bg-warning);
+}
+.warning span:first-of-type {
+  background: var(--bg-warning-label);
+  flex-grow: 0;
+  font-weight: 700;
+}
+.warning span.warning-action {
+  flex-grow: 0;
+  white-space: nowrap;
+}
+button.danger {
+  background: var(--danger);
+  color: var(--danger-text);
+  border-color: var(--danger);
 }

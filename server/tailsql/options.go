@@ -63,6 +63,12 @@ type Options struct {
 	// The maximum timeout for a database query (0 means no timeout).
 	QueryTimeout Duration `json:"queryTimeout,omitempty"`
 
+	// If non-empty, append an audit record for each query to this file, as one
+	// JSON object per line: who ran it (their Tailscale identity, when the
+	// server has a LocalClient), the query, the review decision, and the
+	// outcome. The path is expanded by os.ExpandEnv.
+	AuditLog string `json:"auditLog,omitempty"`
+
 	// The fields below are not encoded for storage.
 
 	// A connection to tailscaled for authorization checks. If nil, no
@@ -109,6 +115,9 @@ type Options struct {
 	// checks, such as asking an LLM whether the query is safe to run (see the
 	// llmreview package).  Named queries ("named:...") and meta-queries are
 	// defined by the operator and are not passed to ReviewQuery.
+	//
+	// If ReviewQuery reports a ReviewWarning, the query is not rejected outright:
+	// the caller is shown the warning and may confirm it to run the query anyway.
 	ReviewQuery func(ctx context.Context, caller string, q Query) error `json:"-"`
 
 	// If non-nil, send logs to this logger. If nil, use log.Printf.
@@ -629,6 +638,16 @@ type Query struct {
 	Source string // the data source requested
 	Query  string // the text of the query
 }
+
+// A ReviewWarning is an error reported by a ReviewQuery hook to indicate that
+// a query may run only after the caller explicitly confirms it, for example a
+// write that affects many rows. Any other error from the hook rejects the query
+// with no option to confirm.
+type ReviewWarning struct {
+	Reason string // why the query needs confirmation
+}
+
+func (w ReviewWarning) Error() string { return "needs confirmation: " + w.Reason }
 
 // DefaultCheckQuery is the default query check function used if another is not
 // specified in the Options. It accepts all queries for all sources, as long as
